@@ -13,12 +13,16 @@ photosync.env 는 읽지 않고 인자로 준 값만 대상으로 한다. (시�
 
 없는 계정, '-'로 시작하는 이름, 조회에 실패한 그룹은 건너뛰고 나머지를 계속 처리하며, 그런 문제가 하나라도 있으면 종료 코드 1이다.
 
-종료 코드: 0 정상, 1 일부 계정·그룹에 문제가 있었던 경우, 2 처리할 사용자를 정할 수 없는 경우
+같은 폴더의 photosync.lock 으로 동시 실행을 막는다. 이전 실행이 끝나지 않았으면 아무것도 하지 않고 종료 코드 0으로 끝낸다.
+실행이 끝나면 사용자별, 전체 처리 건수를 요약 한 줄로 남긴다.
+
+종료 코드: 0 정상(이미 실행 중이라 건너뛴 경우 포함), 1 일부 계정·그룹에 문제가 있었던 경우, 2 처리할 사용자를 정할 수 없는 경우
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
 import sys
@@ -36,6 +40,8 @@ from target_user_resolver import (
 
 DEFAULT_ENV_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photosync.env")
 
+LOCK_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photosync.lock")
+
 ACTION_KEEP = "keep"
 ACTION_CREATE = "create"
 ACTION_FOLDER_SET_CHANGED = "folder_set_changed"
@@ -49,6 +55,53 @@ class PlannedAlbumAction:
     folder_ids: tuple[int, ...]
     existing_album_id: int | None = None
     existing_condition: dict | None = None
+
+
+@dataclass
+class SyncSummary:
+    """한 사용자(또는 전체)에서 처리한 건수. 드라이런이면 '할 예정'인 건수다."""
+    created_album_count: int = 0
+    folder_updated_album_count: int = 0
+    unchanged_album_count: int = 0
+    cover_changed_album_count: int = 0
+    skipped_empty_album_count: int = 0
+    name_conflict_album_count: int = 0
+
+    def add(self, other: SyncSummary) -> None:
+        self.created_album_count += other.created_album_count
+        self.folder_updated_album_count += other.folder_updated_album_count
+        self.unchanged_album_count += other.unchanged_album_count
+        self.cover_changed_album_count += other.cover_changed_album_count
+        self.skipped_empty_album_count += other.skipped_empty_album_count
+        self.name_conflict_album_count += other.name_conflict_album_count
+
+    def describe(self) -> str:
+        return (
+            "생성 %d / 폴더 조건 변경 %d / 유지 %d / 커버 변경 %d / 사진 없어 건너뜀 %d / 이름 충돌 %d"
+            % (
+                self.created_album_count,
+                self.folder_updated_album_count,
+                self.unchanged_album_count,
+                self.cover_changed_album_count,
+                self.skipped_empty_album_count,
+                self.name_conflict_album_count,
+            )
+        )
+
+
+def acquire_run_lock(lock_file_path: str):
+    """다른 실행이 없으면 잠금을 잡고 파일 객체를, 이미 실행 중이면 None 을 돌려 준다.
+
+    잠금은 프로세스가 끝나면(비정상 종료 포함) 운영체제가 풀어 주므로 찌꺼기 파일이 남아도 문제없다.
+    돌려받은 파일 객체를 닫지 말고 끝까지 들고 있어야 잠금이 유지된다.
+    """
+    lock_file = open(lock_file_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
 
 
 def plan_album_actions(
@@ -100,24 +153,28 @@ def plan_album_actions(
 def refresh_album_cover(
     client: SynologyPhotosClient, album_id: int, album_name: str, apply_changes: bool,
     logger: logging.Logger,
-) -> None:
-    """앨범 커버가 가장 늦게 촬영된 사진이 아니면 바꾼다."""
+) -> bool:
+    """앨범 커버가 가장 늦게 촬영된 사진이 아니면 바꾼다. 바꿨거나 바꿀 예정이면 True."""
     latest_item_id = client.get_latest_item_id_in_album(album_id)
     if latest_item_id is None:
         logger.info("[%s] 사진이 없어 커버를 건너뜁니다", album_name)
-        return
+        return False
     current_cover_item_id = client.get_album_cover_item_id(album_id)
     if current_cover_item_id == latest_item_id:
         logger.info("[%s] 커버가 이미 최신 사진입니다 (항목 %s)", album_name, latest_item_id)
-        return
+        return False
     if not apply_changes:
         logger.info("[%s] (드라이런) 커버를 항목 %s로 바꿀 예정", album_name, latest_item_id)
-        return
+        return True
     client.set_album_cover(album_id, latest_item_id)
     logger.info("[%s] 커버를 항목 %s로 변경했습니다", album_name, latest_item_id)
+    return True
 
 
-def run_sync(client: SynologyPhotosClient, apply_changes: bool, logger: logging.Logger) -> None:
+def run_sync(
+    client: SynologyPhotosClient, apply_changes: bool, logger: logging.Logger
+) -> SyncSummary:
+    summary = SyncSummary()
     root_folder = client.get_root_folder()
     folder_id_by_path, leaf_folder_paths = collect_folder_tree(
         root_folder.folder_id, client.list_child_folders
@@ -139,6 +196,7 @@ def run_sync(client: SynologyPhotosClient, apply_changes: bool, logger: logging.
                 "[%s] 같은 이름의 앨범이 있지만 폴더 조건이 없는 앨범이라 건드리지 않습니다",
                 album_name,
             )
+            summary.name_conflict_album_count += 1
             continue
 
         if planned_action.action_kind == ACTION_FOLDER_SET_CHANGED:
@@ -158,6 +216,7 @@ def run_sync(client: SynologyPhotosClient, apply_changes: bool, logger: logging.
                     "[%s] 폴더 조건을 %s에서 %s로 바꿨습니다 (앨범 %s)",
                     album_name, current_folder_ids, wanted_folder_ids, album_id,
                 )
+            summary.folder_updated_album_count += 1
 
         if planned_action.action_kind == ACTION_CREATE:
             item_count = client.count_items_in_folders(
@@ -165,23 +224,42 @@ def run_sync(client: SynologyPhotosClient, apply_changes: bool, logger: logging.
             )
             if item_count == 0:
                 logger.info("[%s] 사진이 없어 앨범을 만들지 않습니다", album_name)
+                summary.skipped_empty_album_count += 1
                 continue
             if not apply_changes:
                 logger.info(
                     "[%s] (드라이런) 폴더 %s로 조건부 앨범을 만들 예정 (사진 %d장)",
                     album_name, list(planned_action.folder_ids), item_count,
                 )
+                summary.created_album_count += 1
                 continue
             album_id = client.create_condition_album(
                 album_name, root_folder.owner_user_id, list(planned_action.folder_ids)
             )
             logger.info("[%s] 조건부 앨범을 만들었습니다 (앨범 %s)", album_name, album_id)
+            summary.created_album_count += 1
+
+        if planned_action.action_kind == ACTION_KEEP:
+            summary.unchanged_album_count += 1
 
         if album_id is not None:
-            refresh_album_cover(client, album_id, album_name, apply_changes, logger)
+            if refresh_album_cover(client, album_id, album_name, apply_changes, logger):
+                summary.cover_changed_album_count += 1
+    return summary
 
 
 def main() -> int:
+    lock_file = acquire_run_lock(LOCK_FILE_PATH)
+    if lock_file is None:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        logging.getLogger("sync_album_folders").warning(
+            "이전 실행이 아직 끝나지 않아 이번 실행은 건너뜁니다 (%s)", LOCK_FILE_PATH
+        )
+        return 0
+    return run_with_arguments()
+
+
+def run_with_arguments() -> int:
     argument_parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     argument_parser.add_argument(
         "--photos_users", metavar="USERS",
@@ -227,6 +305,7 @@ def main() -> int:
         return 2
 
     failed_user_names: list[str] = []
+    total_summary = SyncSummary()
     for user_name in target_users.user_names:
         logger.info("===== 사용자 %s =====", user_name)
         if not does_dsm_user_exist(user_name):
@@ -235,11 +314,18 @@ def main() -> int:
             continue
         client = SynologyPhotosClient(SynowebapiTransport(user_name).call_api)
         try:
-            run_sync(client, apply_changes, logger)
+            user_summary = run_sync(client, apply_changes, logger)
+            logger.info("[%s] 요약: %s", user_name, user_summary.describe())
+            total_summary.add(user_summary)
         except SynologyApiError as api_error:
             logger.error("[%s] API 오류: %s", user_name, api_error)
             failed_user_names.append(user_name)
 
+    logger.info(
+        "전체 요약 (%s, 사용자 %d명 중 실패 %d명): %s",
+        "적용" if apply_changes else "드라이런",
+        len(target_users.user_names), len(failed_user_names), total_summary.describe(),
+    )
     if failed_user_names or target_users.problem_messages:
         logger.error(
             "문제가 있었습니다. 실패한 사용자: %s, 건너뛴 설정 항목 %d개",
